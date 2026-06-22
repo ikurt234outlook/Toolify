@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Literal, Union
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, ValidationError
 
 from config_loader import config_loader
@@ -1463,19 +1463,9 @@ def find_upstream(model_name: str) -> tuple[Dict[str, Any], str]:
     # Handle model passthrough mode
     if app_config.features.model_passthrough:
         logger.info("🔄 Model passthrough mode is active. Forwarding to 'openai' service.")
-        openai_service = None
-        for service in app_config.upstream_services:
-            if service.name == "openai":
-                openai_service = service.model_dump()
-                break
-        
-        if openai_service:
-            if not openai_service.get("api_key"):
-                 raise HTTPException(status_code=500, detail="Configuration error: API key not found for the 'openai' service in model passthrough mode.")
-            # In passthrough mode, the model name from the request is used directly.
-            return openai_service, model_name
-        else:
-            raise HTTPException(status_code=500, detail="Configuration error: 'model_passthrough' is enabled, but no upstream service named 'openai' was found.")
+        passthrough_service = get_openai_passthrough_service()
+        # In passthrough mode, the model name from the request is used directly.
+        return passthrough_service, model_name
 
     # Default routing logic
     chosen_model_entry = model_name
@@ -1516,30 +1506,66 @@ def _get_upstream_retry_delay(attempt: int) -> float:
     base_delay = getattr(app_config.server, "upstream_retry_base_delay", 0.5)
     return base_delay * (2 ** attempt)
 
-async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str, str], timeout: int) -> httpx.Response:
-    """POST to upstream with automatic retry on connection errors and timeouts."""
+def get_openai_passthrough_service() -> Dict[str, Any]:
+    """Return the configured passthrough upstream named `openai`."""
+    for service in app_config.upstream_services:
+        if service.name == "openai":
+            service_dict = service.model_dump()
+            if not service_dict.get("api_key"):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Configuration error: API key not found for the 'openai' service in model passthrough mode."
+                )
+            return service_dict
+
+    raise HTTPException(
+        status_code=500,
+        detail="Configuration error: 'model_passthrough' is enabled, but no upstream service named 'openai' was found."
+    )
+
+
+async def _request_upstream_with_retry(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+    json_body: Optional[dict] = None,
+) -> httpx.Response:
+    """Send an upstream request with automatic retry on connection errors and timeouts."""
     max_attempts = _get_upstream_retry_attempts()
+    request_kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout}
+    if json_body is not None:
+        request_kwargs["json"] = json_body
+
     if max_attempts <= 0:
-        return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
+        return await http_client.request(method, url, **request_kwargs)
 
     last_error: Optional[Exception] = None
     for attempt in range(max_attempts):
         try:
-            return await http_client.post(url, json=json_body, headers=headers, timeout=timeout)
+            return await http_client.request(method, url, **request_kwargs)
         except Exception as exc:
             last_error = exc
             if not _is_retriable_upstream_error(exc) or attempt >= max_attempts - 1:
                 raise
             delay = _get_upstream_retry_delay(attempt)
             logger.warning(
-                "⚠️ Upstream POST failed with %s; retrying in %.1fs (%s/%s)",
-                type(exc).__name__, delay, attempt + 2, max_attempts,
+                "⚠️ Upstream %s failed with %s; retrying in %.1fs (%s/%s)",
+                method,
+                type(exc).__name__,
+                delay,
+                attempt + 2,
+                max_attempts,
             )
             await asyncio.sleep(delay)
 
     if last_error is not None:
         raise last_error
     raise RuntimeError("Unreachable upstream retry state")
+
+async def _post_upstream_with_retry(url: str, json_body: dict, headers: Dict[str, str], timeout: int) -> httpx.Response:
+    """POST to upstream with automatic retry on connection errors and timeouts."""
+    return await _request_upstream_with_retry("POST", url, headers, timeout, json_body=json_body)
 
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
@@ -2601,6 +2627,35 @@ def read_root():
 @app.get("/v1/models")
 async def list_models(_api_key: str = Depends(verify_api_key)):
     """List all available models"""
+    if app_config.features.model_passthrough:
+        upstream = get_openai_passthrough_service()
+        upstream_url = f"{upstream['base_url']}/models"
+        headers = {
+            "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
+            "Accept": "application/json"
+        }
+
+        logger.info(f"📝 Proxying models list to upstream: {upstream['name']}")
+
+        try:
+            upstream_response = await _request_upstream_with_retry(
+                "GET",
+                upstream_url,
+                headers,
+                app_config.server.timeout,
+            )
+        except Exception as exc:
+            logger.error(f"❌ Failed to fetch upstream models list: {exc}")
+            logger.error(f"❌ Error type: {type(exc).__name__}")
+            raise HTTPException(status_code=502, detail="Failed to fetch models from upstream service")
+
+        content_type = upstream_response.headers.get("content-type", "application/json")
+        return Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            media_type=content_type.split(";")[0].strip() if content_type else "application/json",
+        )
+
     visible_models = set()
     for model_name in MODEL_TO_SERVICE_MAPPING.keys():
         if ':' in model_name:

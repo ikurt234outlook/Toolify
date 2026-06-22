@@ -6,7 +6,7 @@
 import os
 import yaml
 from typing import List, Dict, Any, Set, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ServerConfig(BaseModel):
@@ -107,36 +107,34 @@ class AppConfig(BaseModel):
     client_authentication: ClientAuthConfig = Field(description="Client authentication configuration")
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     
-    @field_validator('upstream_services')
-    def validate_upstream_services(cls, v, info):
-        if not v or len(v) == 0:
+    @model_validator(mode='after')
+    def validate_configuration(self):
+        if not self.upstream_services or len(self.upstream_services) == 0:
             raise ValueError('upstream_services cannot be empty')
-        
-        # Get features config to check model_passthrough mode
-        features = info.data.get('features', FeaturesConfig())
-        model_passthrough = features.model_passthrough if hasattr(features, 'model_passthrough') else False
-        
+
+        model_passthrough = self.features.model_passthrough
+
         # In model_passthrough mode, check for 'openai' service existence
         if model_passthrough:
-            openai_service = next((s for s in v if s.name == 'openai'), None)
+            openai_service = next((s for s in self.upstream_services if s.name == 'openai'), None)
             if not openai_service:
                 raise ValueError("When model_passthrough is enabled, an upstream service named 'openai' must be configured")
         else:
             # In normal mode, validate that services have models
-            for service in v:
+            for service in self.upstream_services:
                 if not service.models or len(service.models) == 0:
                     raise ValueError(f"Service '{service.name}' must have at least one model when model_passthrough is disabled")
-        
-        default_services = [service for service in v if service.is_default]
+
+        default_services = [service for service in self.upstream_services if service.is_default]
         if len(default_services) == 0:
             raise ValueError('Must have at least one default upstream service (is_default: true)')
         if len(default_services) > 1:
             raise ValueError('Only one upstream service can be marked as default')
-        
+
         all_models = set()
         all_aliases = set()
-        
-        for service in v:
+
+        for service in self.upstream_services:
             for model in service.models:
                 if model in all_models:
                     raise ValueError(f'Duplicate model entry found: {model}')
@@ -156,8 +154,8 @@ class AppConfig(BaseModel):
         conflicts = all_aliases.intersection(regular_models)
         if conflicts:
             raise ValueError(f"Alias names {conflicts} conflict with model names.")
-                
-        return v
+
+        return self
 
 
 class ConfigLoader:

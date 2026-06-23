@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Optional, Literal, Union
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse, StreamingResponse, Response
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, ConfigDict
 
 from config_loader import config_loader
 
@@ -1013,8 +1013,7 @@ class Message(BaseModel):
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(populate_by_name=True)
 
 class ToolChoice(BaseModel):
     type: Literal["function"]
@@ -1035,8 +1034,7 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(populate_by_name=True)
 
 
 def generate_function_prompt(tools: List[Tool], trigger_signal: str) -> tuple[str, str]:
